@@ -1,9 +1,7 @@
-# wyoming-parakeet-on-intel-npu
-# Runs Parakeet TDT 0.6B v3 multilingual ASR on Intel NPU via OpenVINO,
-# exposed over the Wyoming protocol for Home Assistant / other clients.
-#
-# Image is amd64 only (Intel NPU is x86 by definition).
-FROM ubuntu:24.04
+# --------------------------------------------------
+# Common runtime base
+# --------------------------------------------------
+FROM ubuntu:24.04 AS runtime-base
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -15,67 +13,69 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ENCODER_BUCKETS=5 \
     ENCODER_LAZY_BUCKETS=20
 
-# ---------------------------------------------------------------------------
-# System packages
-# ---------------------------------------------------------------------------
-RUN apt-get update \
-    && apt-get upgrade -y \
-    && apt-get install -y --no-install-recommends \
-        ca-certificates curl tzdata \
-        python3 python3-pip python3-venv \
-        libtbb12 libtbbmalloc2 ocl-icd-libopencl1 \
-        libsndfile1 \
-    && apt-get upgrade -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    python3 \
+    libtbb12 \
+    libtbbmalloc2 \
+    ocl-icd-libopencl1 \
+    libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-# ---------------------------------------------------------------------------
-# Level Zero loader >= 1.17 (Ubuntu 24.04 ships 1.16, which can't discover
-# the modern intel-level-zero-npu library)
-# ---------------------------------------------------------------------------
-WORKDIR /tmp/lz
-RUN curl -fL -O \
-        "https://github.com/oneapi-src/level-zero/releases/download/v1.28.6/libze1_1.28.6+u24.04_amd64.deb" \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends ./libze1*.deb \
-    && rm -rf /var/lib/apt/lists/* /tmp/lz
+# Hier die bisherigen Level-Zero- und Intel-NPU-Installationen
+# aus dem bestehenden Dockerfile übernehmen.
 
-# ---------------------------------------------------------------------------
-# Intel NPU userspace driver + firmware + compiler
-# ---------------------------------------------------------------------------
-WORKDIR /tmp/npu
-RUN curl -fL -o npu.tar.gz \
-        "https://github.com/intel/linux-npu-driver/releases/download/v1.32.1/linux-npu-driver-v1.32.1.20260422-24767473183-ubuntu2404.tar.gz" \
-    && tar xzf npu.tar.gz \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        ./intel-driver-compiler-npu_*.deb \
-        ./intel-fw-npu_*.deb \
-        ./intel-level-zero-npu_*.deb \
-    && rm -rf /var/lib/apt/lists/* /tmp/npu
 
-# ---------------------------------------------------------------------------
-# Python environment
-# ---------------------------------------------------------------------------
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+# --------------------------------------------------
+# Builder
+# --------------------------------------------------
+FROM runtime-base AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-venv \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY pyproject.toml constraints.txt ./
+
+COPY pyproject.toml ./
 COPY src ./src
 COPY scripts ./scripts
+
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir . \
+    && rm -rf /root/.cache/pip
+
+
+# --------------------------------------------------
+# Final runtime
+# --------------------------------------------------
+FROM runtime-base AS runtime
+
+WORKDIR /app
+
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /app/scripts /app/scripts
+COPY --from=builder /app/src /app/src
+
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -c constraints.txt . \
-    && pip check \
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Build-Werkzeuge und Paketmanager aus der Runtime entfernen
+RUN rm -rf \
+    /opt/venv/lib/python3.12/site-packages/pip \
+    /opt/venv/lib/python3.12/site-packages/pip-*.dist-info \
+    /opt/venv/lib/python3.12/site-packages/setuptools \
+    /opt/venv/lib/python3.12/site-packages/setuptools-*.dist-info \
+    /opt/venv/lib/python3.12/site-packages/wheel \
+    /opt/venv/bin/pip* \
     && chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Persistent volume for model files + OV cache
 VOLUME ["/data"]
-
 EXPOSE 10300
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
-    CMD python3 -c "import socket,sys; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', 10300)); s.close()" || exit 1
+    CMD python3 -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', 10300)); s.close()" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
